@@ -17,18 +17,25 @@ const argOptions = commandLineArgs([
     { name: 'hostip', type: String, defaultValue: process.env.DOCKERSTATS_HOSTIP || '', },
     { name: 'hostport', type: Number, defaultValue: process.env.DOCKERSTATS_HOSTPORT || 0, },
     { name: 'collectdefault', type: Boolean, },
+    // namefilter is a 'string' to be used on docker --filter name=xxxxx to select specific containers
+    // example value: "(sleep2|.*test)"
+    { name: 'namefilter', type: String, defaultValue: process.env.DOCKERSTATS_NAMEFILTER || '', },
+    { name: 'labelfilter', type: String, defaultValue: process.env.DOCKERSTATS_NAMEFILTER || '.*', },
+    //{ name: 'labelfilter', type: String, defaultValue: process.env.DOCKERSTATS_NAMEFILTER || ".*(?=.*x=y)(?=.*z=0).*", },
 ]);
 const port = argOptions.port;
 const interval = argOptions.interval >= 3 ? argOptions.interval : 3;
 const dockerIP = argOptions.hostip;
 const dockerPort = argOptions.hostport;
 const collectDefaultMetrics = process.env.DOCKERSTATS_DEFAULTMETRICS || argOptions.collectdefault;
+const namefilter = argOptions.namefilter;
+const labelfilter = new RegExp(argOptions.labelfilter);
 
 // Connect to docker
 let dockerOptions;
 if (dockerIP && dockerPort) {
     dockerOptions = { host: dockerIP, port: dockerPort, };
-    console.log(`INFO: Connecting to Docker on ${dockerIP}:${dockerPort}...`);
+    console.log(`INFO: Connecting to Docker on ${dockerIP}:${dockerPort}...interval:${interval} namefilter:${namefilter} collectDefaultMetrics:${collectDefaultMetrics}`);
 } else {
     dockerOptions = { socketPath: '/var/run/docker.sock' };
     console.log(`INFO: Connecting to Docker on /var/run/docker.sock...`);
@@ -43,47 +50,47 @@ if (!docker) {
 const gaugeCpuUsageRatio = new prom.Gauge({
     'name': appName + '_cpu_usage_ratio',
     'help': 'CPU usage percentage 0-100',
-    'labelNames': ['name', 'id'],
+    'labelNames': ['name', 'id', 'labels'],
 });
 const gaugeMemoryUsageBytes = new prom.Gauge({
     'name': appName + '_memory_usage_bytes',
     'help': 'Memory usage in bytes',
-    'labelNames': ['name', 'id'],
+    'labelNames': ['name', 'id', 'labels'],
 });
 const gaugeMemoryUsageRssBytes = new prom.Gauge({
     'name': appName + '_memory_usage_rss_bytes',
     'help': 'Memory rss usage in bytes',
-    'labelNames': ['name', 'id'],
+    'labelNames': ['name', 'id', 'labels'],
 });
 const gaugeMemoryLimitBytes = new prom.Gauge({
     'name': appName + '_memory_limit_bytes',
     'help': 'Memory limit in bytes',
-    'labelNames': ['name', 'id'],
+    'labelNames': ['name', 'id', 'labels'],
 });
 const gaugeMemoryUsageRatio = new prom.Gauge({
     'name': appName + '_memory_usage_ratio',
     'help': 'Memory usage percentage 0-100',
-    'labelNames': ['name', 'id'],
+    'labelNames': ['name', 'id', 'labels'],
 });
 const gaugeNetworkReceivedBytes = new prom.Gauge({
     'name': appName + '_network_received_bytes',
     'help': 'Network received in bytes',
-    'labelNames': ['name', 'id'],
+    'labelNames': ['name', 'id', 'labels'],
 });
 const gaugeNetworkTransmittedBytes = new prom.Gauge({
     'name': appName + '_network_transmitted_bytes',
     'help': 'Network transmitted in bytes',
-    'labelNames': ['name', 'id'],
+    'labelNames': ['name', 'id', 'labels'],
 });
 const gaugeBlockIoReadBytes = new prom.Gauge({
     'name': appName + '_blockio_read_bytes',
     'help': 'Block IO read in bytes',
-    'labelNames': ['name', 'id'],
+    'labelNames': ['name', 'id', 'labels'],
 });
 const gaugeBlockIoWrittenBytes = new prom.Gauge({
     'name': appName + '_blockio_written_bytes',
     'help': 'Block IO written in bytes',
-    'labelNames': ['name', 'id'],
+    'labelNames': ['name', 'id', 'labels'],
 });
 
 // Register all metrics
@@ -123,25 +130,43 @@ const server = http.createServer((req, res) => {
 }).listen(port);
 server.setTimeout(20000);
 console.log(`INFO: Docker Stats exporter listening on port ${port}`);
+if ( namefilter ) {
+    console.log(`INFO: ONLY for containers w/ name matching filter: "${namefilter}"`);
+}
 
 // Main function to get the metrics for each container
 async function gatherMetrics() {
     try {
-
-        // Get all containers
-        const containers = await docker.listContainers();
+        // if namefilter is empty, the filter will return all containers
+        const containers = await docker.listContainers( { "filters": `{"name": ["${namefilter}"]}` } );
         if (!containers || !Array.isArray(containers) || !containers.length) {
             throw new Error('ERROR: Unable to get containers');
         }
 
-        // Get stats for each container in one go
+        // Get stats and labels for each container in one go
         const promises = [];
         for (let container of containers) {
             if (container.Id) {
-                promises.push(docker.getContainer(container.Id).stats({ 'stream': false, 'decode': true }));
+                const statsPromise = docker.getContainer(container.Id).stats({ 'stream': false, 'decode': true });
+                const inspectPromise = new Promise((resolve, reject) => {
+                    docker.getContainer(container.Id).inspect((err, data) => {
+                        if (!err) {                   
+                            const dockerlabels = data.Config.Labels;
+                            resolve({ containerData: container, dockerlabels });
+                        } else {
+                            reject(err);
+                        }
+                    });
+                });
+
+                promises.push(Promise.all([statsPromise, inspectPromise]));
             }
-        }
-        const results = await Promise.all(promises);
+        };
+        const preresults = await Promise.all(promises);
+        const results = preresults.map(([statsPromise, { containerData, dockerlabels }]) => ({
+            ...statsPromise,
+            dockerlabels
+        }));
 
         // Reset all to zero before proceeding
         register.resetMetrics();
@@ -151,7 +176,14 @@ async function gatherMetrics() {
             const labels = {
                 'name': result['name'].replace('/', ''),
                 'id': result['id'].slice(0, 12),
+                'labels': Object.entries(result['dockerlabels'])
+                  .filter(([key, value]) => !key.includes('com.docker.'))
+                  .map(([key, value]) => `${key}=${value}`)
+                  .join(',')
             };
+            if (!labelfilter.test(labels['labels'])) {
+                continue;
+            }
 
             // CPU
             if (result['cpu_stats'] && result['cpu_stats']['cpu_usage'] && result['precpu_stats'] && result['precpu_stats']['cpu_usage']) {
