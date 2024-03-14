@@ -20,8 +20,10 @@ const argOptions = commandLineArgs([
     // namefilter is a 'string' to be used on docker --filter name=xxxxx to select specific containers
     // example value: "(sleep2|.*test)"
     { name: 'namefilter', type: String, defaultValue: process.env.DOCKERSTATS_NAMEFILTER || '', },
-    { name: 'labelfilter', type: String, defaultValue: process.env.DOCKERSTATS_NAMEFILTER || '.*', },
+    { name: 'labelfilter', type: String, defaultValue: process.env.DOCKERSTATS_LABELFILTER || '.*', },
     //{ name: 'labelfilter', type: String, defaultValue: process.env.DOCKERSTATS_NAMEFILTER || ".*(?=.*x=y)(?=.*z=0).*", },
+    { name: 'labelhide', type: String, defaultValue: process.env.DOCKERSTATS_LABELHIDE || 'com.docker.*|io.docker.*|org.dockerproject.*', }, //'com.docker.*|io.docker.*|org.dockerproject.*', },
+    { name: 'labelshow', type: String, defaultValue: process.env.DOCKERSTATS_LABELSHOW || 'z=*', } //'.*', }
 ]);
 const port = argOptions.port;
 const interval = argOptions.interval >= 3 ? argOptions.interval : 3;
@@ -30,6 +32,8 @@ const dockerPort = argOptions.hostport;
 const collectDefaultMetrics = process.env.DOCKERSTATS_DEFAULTMETRICS || argOptions.collectdefault;
 const namefilter = argOptions.namefilter;
 const labelfilter = new RegExp(argOptions.labelfilter);
+const labelhide = new RegExp(argOptions.labelhide);
+const labelshow = new RegExp(argOptions.labelshow);
 
 // Connect to docker
 let dockerOptions;
@@ -177,7 +181,8 @@ async function gatherMetrics() {
                 'name': result['name'].replace('/', ''),
                 'id': result['id'].slice(0, 12),
                 'labels': Object.entries(result['dockerlabels'])
-                  .filter(([key, value]) => !key.includes('com.docker.'))
+                  .filter(([key, value]) => !labelhide.test(`${key}=${value}`))
+                  .filter(([key, value]) => labelshow.test(`${key}=${value}`))
                   .map(([key, value]) => `${key}=${value}`)
                   .join(',')
             };
